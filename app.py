@@ -76,6 +76,7 @@ DRONE_SPEED_KMH = 70
 DRONE_RANGE_KM = 15
 DRONE_FLIGHTS_BEFORE_BATTERY = 5
 DRONE_BATTERY_MINUTES = 5
+SECOND_DRONE_SURCHARGE = 50
 
 PIZZA_PRICE = 60
 TOPPING_PRICE = 10
@@ -278,9 +279,11 @@ def simulate(orders: list[dict[str, Any]], sequence: list[int], tuesday: bool) -
         drone["flights"] = 0 if drone["flights"] >= DRONE_FLIGHTS_BEFORE_BATTERY else drone["flights"] + 1
 
         elapsed = delivered - order["ArrivalMinute"]
-        refund, refund_label = compensation(elapsed, order["Revenue"])
+        drone_surcharge = SECOND_DRONE_SURCHARGE if drone_index > 0 else 0
+        charged_revenue = order["Revenue"] + drone_surcharge
+        refund, refund_label = compensation(elapsed, charged_revenue)
         oven_c_cost = OVEN_C_COST_PER_PIZZA * order["PizzaCount"] if oven["name"] == "Oven C" else 0
-        realized = order["Revenue"] - order["MaterialCost"] - refund - oven_c_cost
+        realized = charged_revenue - order["MaterialCost"] - refund - oven_c_cost
         details.append(
             {
                 "Sequence": position,
@@ -292,6 +295,9 @@ def simulate(orders: list[dict[str, Any]], sequence: list[int], tuesday: bool) -
                 "OnTime": "Yes" if elapsed <= SLA_MINUTES else "No",
                 "RefundOrCompensation": refund_label,
                 "CompensationCost": refund,
+                "DroneNumber": drone_index + 1,
+                "DroneSurcharge": drone_surcharge,
+                "ChargedRevenue": charged_revenue,
                 "Oven": oven["name"],
                 "OvenCCost": oven_c_cost,
                 "RealizedContribution": realized,
@@ -301,6 +307,7 @@ def simulate(orders: list[dict[str, Any]], sequence: list[int], tuesday: bool) -
     details_df = pd.DataFrame(details)
     contribution = float(details_df["RealizedContribution"].sum()) if not details_df.empty else 0.0
     total_comp = float(details_df["CompensationCost"].sum()) if not details_df.empty else 0.0
+    drone_surcharge_total = float(details_df["DroneSurcharge"].sum()) if not details_df.empty else 0.0
     full_refunds = int((details_df["RefundOrCompensation"] == "Full refund").sum()) if not details_df.empty else 0
     labor = labor_cost(tuesday)
     pre_tax = contribution - labor - DAILY_FIXED_COST
@@ -308,6 +315,8 @@ def simulate(orders: list[dict[str, Any]], sequence: list[int], tuesday: bool) -
     return {
         "details": details_df,
         "contribution": contribution,
+        "total_compensation_cost": total_comp,
+        "drone_surcharge_total": drone_surcharge_total,
         "labor": labor,
         "fixed": DAILY_FIXED_COST,
         "pre_tax": pre_tax,
@@ -498,6 +507,9 @@ with tab_dashboard:
             )
             st.write(
                 f"Adjusted net profit: {money(ai['adjusted_net'])} | "
+                f"Contribution after delivery costs: {money(ai['contribution'])} | "
+                f"Drone surcharges: {money(ai['drone_surcharge_total'])} | "
+                f"Compensation/refunds: {money(ai['total_compensation_cost'])} | "
                 f"Labor: {money(ai['labor'])} | Fixed rent/electricity: {money(ai['fixed'])} | "
                 f"Tax rate: {TAX_RATE:.0%}"
             )
