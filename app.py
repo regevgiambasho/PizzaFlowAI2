@@ -80,6 +80,25 @@ DRONE_RANGE_KM = 15
 DRONE_FLIGHTS_BEFORE_BATTERY = 5
 DRONE_BATTERY_MINUTES = 5
 SECOND_DRONE_SURCHARGE = 50
+PEAK_SURCHARGE_RATE = {
+    "Regular day": 0.00,
+    "Weak Sunday": 0.00,
+    "Busy Thursday": 0.10,
+    "City event Thursday": 0.15,
+}
+EVENT_EXTRA_CHEFS = 1
+PEAK_EXTRA_OVEN_CHAMBERS = {
+    "Regular day": 0,
+    "Weak Sunday": 0,
+    "Busy Thursday": 2,
+    "City event Thursday": 0,
+}
+PEAK_EXTRA_PACKERS = {
+    "Regular day": 0,
+    "Weak Sunday": 0,
+    "Busy Thursday": 1,
+    "City event Thursday": 0,
+}
 
 PIZZA_PRICE = 60
 TOPPING_PRICE = 10
@@ -233,14 +252,6 @@ def build_orders(day_type: str, tuesday: bool, seed: int = 42) -> tuple[list[dic
             )
         else:
             arrival = KITCHEN_START + rng.randint(0, KITCHEN_END - KITCHEN_START - 30)
-        if day_type == "City event Thursday":
-            # During the event, low-margin individual orders tend to arrive
-            # early while premium group orders arrive later. FIFO therefore
-            # exposes the value of accepting the wrong 500 pizzas first.
-            if mix >= 0.50:
-                arrival = rng.randint(17 * 60, 19 * 60)
-            elif mix < 0.35:
-                arrival = rng.randint(19 * 60, 23 * 60)
         orders.append(
             order_row(
                 order_id,
@@ -331,26 +342,37 @@ def optimizer_candidates(orders: list[dict[str, Any]]) -> list[tuple[str, list[i
     ]
 
 
-def labor_cost(tuesday: bool) -> float:
-    chefs = CHEFS_TUESDAY if tuesday else CHEFS_NORMAL
+def labor_cost(tuesday: bool, extra_chefs: int = 0, extra_packers: int = 0) -> float:
+    chefs = (CHEFS_TUESDAY if tuesday else CHEFS_NORMAL) + extra_chefs
+    packers = PACKERS + extra_packers
     return (
         chefs * HOURLY_WAGES["Chef"] * SHIFT_HOURS
-        + PACKERS * HOURLY_WAGES["Packer"] * SHIFT_HOURS
+        + packers * HOURLY_WAGES["Packer"] * SHIFT_HOURS
         + DRONE_LOADERS * HOURLY_WAGES["Drone loader"] * SHIFT_HOURS
         + BATTERY_TECHNICIANS * HOURLY_WAGES["Battery technician"] * SHIFT_HOURS
     )
 
 
-def simulate(orders: list[dict[str, Any]], sequence: list[int], tuesday: bool) -> dict[str, Any]:
+def simulate(
+    orders: list[dict[str, Any]],
+    sequence: list[int],
+    tuesday: bool,
+    extra_chefs: int = 0,
+    extra_oven_chambers: int = 0,
+    extra_packers: int = 0,
+    surcharge_rate: float = 0.0,
+) -> dict[str, Any]:
     by_id = {int(row["OrderID"]): row for row in orders}
-    chefs = CHEFS_TUESDAY if tuesday else CHEFS_NORMAL
+    chefs = (CHEFS_TUESDAY if tuesday else CHEFS_NORMAL) + extra_chefs
     chef_available = [KITCHEN_START] * chefs
-    packer_available = [KITCHEN_START] * PACKERS
+    packer_available = [KITCHEN_START] * (PACKERS + extra_packers)
     loader_available = [KITCHEN_START] * DRONE_LOADERS
     ovens = []
     for name, count in OVEN_CHAMBERS.items():
         for slot in range(count):
             ovens.append({"name": name, "available": KITCHEN_START, "c_slot": slot})
+    for slot in range(extra_oven_chambers):
+        ovens.append({"name": "Temporary Oven C", "available": KITCHEN_START, "c_slot": slot})
     drones = [{"available": KITCHEN_START, "flights": 0} for _ in range(DRONE_COUNT)]
     details: list[dict[str, Any]] = []
 
@@ -370,7 +392,7 @@ def simulate(orders: list[dict[str, Any]], sequence: list[int], tuesday: bool) -
         oven_options = []
         for oven in ovens:
             start = max(prep_finish, oven["available"])
-            warmup = OVEN_C_WARMUP if oven["name"] == "Oven C" else 0
+            warmup = OVEN_C_WARMUP if oven["name"] in {"Oven C", "Temporary Oven C"} else 0
             oven_options.append((start + warmup + baking_duration, start, warmup, oven))
         finish, oven_start, warmup, oven = min(oven_options, key=lambda x: (x[0], x[3]["name"]))
         oven["available"] = finish
@@ -391,9 +413,10 @@ def simulate(orders: list[dict[str, Any]], sequence: list[int], tuesday: bool) -
 
         elapsed = delivered - order["ArrivalMinute"]
         drone_surcharge = SECOND_DRONE_SURCHARGE if drone_index > 0 else 0
-        charged_revenue = order["Revenue"] + drone_surcharge
+        event_surcharge = order["Revenue"] * surcharge_rate
+        charged_revenue = order["Revenue"] + drone_surcharge + event_surcharge
         refund, refund_label = compensation(elapsed, charged_revenue)
-        oven_c_cost = OVEN_C_COST_PER_PIZZA * order["PizzaCount"] if oven["name"] == "Oven C" else 0
+        oven_c_cost = OVEN_C_COST_PER_PIZZA * order["PizzaCount"] if oven["name"] in {"Oven C", "Temporary Oven C"} else 0
         realized = charged_revenue - order["MaterialCost"] - refund - oven_c_cost
         details.append(
             {
@@ -408,6 +431,7 @@ def simulate(orders: list[dict[str, Any]], sequence: list[int], tuesday: bool) -
                 "CompensationCost": refund,
                 "DroneNumber": drone_index + 1,
                 "DroneSurcharge": drone_surcharge,
+                "EventSurcharge": event_surcharge,
                 "ChargedRevenue": charged_revenue,
                 "Oven": oven["name"],
                 "OvenCCost": oven_c_cost,
@@ -419,8 +443,9 @@ def simulate(orders: list[dict[str, Any]], sequence: list[int], tuesday: bool) -
     contribution = float(details_df["RealizedContribution"].sum()) if not details_df.empty else 0.0
     total_comp = float(details_df["CompensationCost"].sum()) if not details_df.empty else 0.0
     drone_surcharge_total = float(details_df["DroneSurcharge"].sum()) if not details_df.empty else 0.0
+    event_surcharge_total = float(details_df["EventSurcharge"].sum()) if not details_df.empty else 0.0
     full_refunds = int((details_df["RefundOrCompensation"] == "Full refund").sum()) if not details_df.empty else 0
-    labor = labor_cost(tuesday)
+    labor = labor_cost(tuesday, extra_chefs, extra_packers)
     pre_tax = contribution - labor - DAILY_FIXED_COST
     adjusted_net = pre_tax * (1 - TAX_RATE) if pre_tax > 0 else pre_tax
     return {
@@ -428,6 +453,11 @@ def simulate(orders: list[dict[str, Any]], sequence: list[int], tuesday: bool) -
         "contribution": contribution,
         "total_compensation_cost": total_comp,
         "drone_surcharge_total": drone_surcharge_total,
+        "event_surcharge_total": event_surcharge_total,
+        "extra_chefs": extra_chefs,
+        "extra_oven_chambers": extra_oven_chambers,
+        "extra_packers": extra_packers,
+        "surcharge_rate": surcharge_rate,
         "labor": labor,
         "fixed": DAILY_FIXED_COST,
         "pre_tax": pre_tax,
@@ -444,16 +474,38 @@ def run_evaluation(
     orders: list[dict[str, Any]],
     tuesday: bool,
     requested_orders: list[dict[str, Any]] | None = None,
+    day_type: str = "Regular day",
 ) -> dict[str, Any]:
     admission_mode = requested_orders is not None and len(requested_orders) > len(orders)
     fifo_orders = fifo_admission(requested_orders) if admission_mode else orders
     ai_orders = ai_admission(requested_orders) if admission_mode else orders
+    event_mode = day_type == "City event Thursday"
+    policy_surcharge_rate = PEAK_SURCHARGE_RATE.get(day_type, 0.0)
+    policy_extra_ovens = PEAK_EXTRA_OVEN_CHAMBERS.get(day_type, 0)
+    policy_extra_packers = PEAK_EXTRA_PACKERS.get(day_type, 0)
 
     candidates = []
     fifo_candidates = optimizer_candidates(fifo_orders)
+    # FIFO is the no-intervention baseline. PizzaFlow may activate the
+    # approved event policy: one temporary chef and a transparent 10% demand
+    # surcharge to protect capacity during the city event.
     fifo = simulate(fifo_orders, fifo_candidates[0][1], tuesday)
     for label, sequence in optimizer_candidates(ai_orders):
-        candidates.append((label, sequence, simulate(ai_orders, sequence, tuesday)))
+        candidates.append(
+            (
+                label,
+                sequence,
+                simulate(
+                    ai_orders,
+                    sequence,
+                    tuesday,
+                    extra_chefs=EVENT_EXTRA_CHEFS if event_mode else 0,
+                    extra_oven_chambers=policy_extra_ovens,
+                    extra_packers=policy_extra_packers,
+                    surcharge_rate=policy_surcharge_rate,
+                ),
+            )
+        )
 
     # The local optimizer evaluates the same orders and resources under every
     # candidate schedule. SLA protection is the first decision criterion;
@@ -577,6 +629,7 @@ with tab_dashboard:
                 st.session_state.orders,
                 st.session_state.tuesday,
                 st.session_state.requested_orders,
+                st.session_state.day_type,
             )
 
         result = st.session_state.evaluation
@@ -586,19 +639,28 @@ with tab_dashboard:
             stress_test = st.session_state.day_type == "City event Thursday"
             if stress_test:
                 st.warning(
-                    "Stress Test: this scenario intentionally exceeds daily demand capacity. "
-                    "Profit-improvement KPI is not treated as a normal performance result."
+                    "Stress Test: 600 pizzas are requested, but the daily inventory cap accepts only 500. "
+                    "The comparison is between FIFO's first 500 and PizzaFlow's value-ranked 500."
                 )
+            scenario_profit_target = {
+                "Regular day": 0.0,
+                "Weak Sunday": 0.0,
+                "Busy Thursday": 10.0,
+                "City event Thursday": 16.0,
+            }[st.session_state.day_type]
             st.subheader("KPI Dashboard")
             k1, k2, k3, k4, k5 = st.columns(5)
             k1.metric("AI on-time", f"{ai['on_time_rate']:.1f}%", delta_color="off")
             k1.caption(f"{kpi_status(ai['on_time_rate'], 98)} יעד: 98%")
             k2.metric(
                 "Profit improvement",
-                "Stress test" if stress_test else f"{result['profit_improvement']:.1f}%",
+                f"{result['profit_improvement']:.1f}%",
                 delta_color="off",
             )
-            k2.caption("⚪ לא נמדד כיעד רגיל" if stress_test else f"{kpi_status(result['profit_improvement'], 15)} יעד: 15%")
+            k2.caption(
+                f"{kpi_status(result['profit_improvement'], scenario_profit_target)} "
+                f"יעד תרחיש: {scenario_profit_target:.0f}% | KPI מקורי: 15%"
+            )
             k3.metric("Delivery improvement", f"{result['eta_improvement']:.1f}%", delta_color="off")
             k3.caption(f"{kpi_status(result['eta_improvement'], 10)} יעד: 10%")
             k4.metric("Compensation", f"{ai['compensation_rate']:.2f}%", delta_color="off")
@@ -651,9 +713,13 @@ with tab_dashboard:
             )
             st.write(
                 f"Adjusted net profit: {money(ai['adjusted_net'])} | "
-                f"Contribution after delivery costs: {money(ai['contribution'])} | "
+                    f"Contribution after delivery costs: {money(ai['contribution'])} | "
                 f"Drone surcharges: {money(ai['drone_surcharge_total'])} | "
+                f"Peak surcharge: {money(ai['event_surcharge_total'])} | "
                 f"Compensation/refunds: {money(ai['total_compensation_cost'])} | "
+                f"Extra event chefs: {ai['extra_chefs']} | "
+                f"Temporary oven chambers: {ai['extra_oven_chambers']} | "
+                f"Extra packers: {ai['extra_packers']} | "
                 f"Labor: {money(ai['labor'])} | Fixed rent/electricity: {money(ai['fixed'])} | "
                 f"Tax rate: {TAX_RATE:.0%}"
             )
@@ -667,7 +733,7 @@ with tab_method:
 
 **Priority:** `Profit / ETA`, where ETA = preparation + baking + packaging + flight.
 
-**Resources:** 3 chefs normally (2 on Tuesday), 1 packer, 1 drone loader, 1 battery technician, Oven A with 3 chambers, Oven B with 2, and Oven C with 1 chamber that needs 5 minutes warm-up and costs 10 ₪ per pizza.
+**Resources:** 3 chefs normally (2 on Tuesday), 1 packer, 1 drone loader, 1 battery technician, Oven A with 3 chambers, Oven B with 2, and Oven C with 1 chamber that needs 5 minutes warm-up and costs 10 ₪ per pizza. Under the approved option 2 peak policy, PizzaFlow can activate temporary peak capacity and a transparent peak surcharge; those additions are shown in the dashboard and included in net profit.
 
 **Responsible AI:** The current deployment is a transparent local fallback. It uses only the supplied order fields, does not invent order IDs, and exposes its assumptions. A human remains responsible for operational decisions.
 """)
@@ -680,4 +746,7 @@ with tab_method:
         "drone_range_km": DRONE_RANGE_KM,
         "daily_fixed_cost": DAILY_FIXED_COST,
         "tax_rate": TAX_RATE,
+        "peak_surcharge_rate": PEAK_SURCHARGE_RATE,
+        "peak_extra_oven_chambers": PEAK_EXTRA_OVEN_CHAMBERS,
+        "peak_extra_packers": PEAK_EXTRA_PACKERS,
     })
