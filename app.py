@@ -1,17 +1,15 @@
 """PizzaFlow AI - final specification implementation.
 
-This is an explainable local decision-support prototype. It does not claim to
-be Generative AI when no API key is configured.
+This is an explainable local decision-support prototype. It includes a local,
+grounded manager assistant so the public deployment does not require an API
+key, an external service, or a paid model.
 """
 
 from __future__ import annotations
 
 import math
-import json
-import os
 import random
-import urllib.error
-import urllib.request
+import re
 from typing import Any
 
 import pandas as pd
@@ -117,91 +115,256 @@ def money(value: float) -> str:
     return f"₪{value:,.0f}"
 
 
-def openai_api_key() -> str | None:
-    """Read the API key from Streamlit Secrets or the environment only."""
-    try:
-        secret_key = st.secrets.get("OPENAI_API_KEY")
-    except Exception:
-        secret_key = None
-    return secret_key or os.getenv("OPENAI_API_KEY")
+def normalize_question(question: str) -> str:
+    """Normalize Hebrew/English text for deterministic local intent matching."""
+    return re.sub(r"[^\w\s/%+-]", " ", question.lower()).strip()
 
 
-def generate_manager_advice(
-    question: str,
-    day_type: str,
-    result: dict[str, Any],
-) -> str:
-    """Generate a grounded managerial explanation from the simulation output."""
+def scenario_description(day_type: str) -> str:
+    """Return the demand assumptions for the selected scenario."""
+    requested = DEMAND_BY_DAY[day_type]
+    if day_type == "Regular day":
+        return "יום רגיל: 350 פיצות מבוקשות, ללא תוספת משאבים או תוספת מחיר."
+    if day_type == "Weak Sunday":
+        return "יום ראשון חלש: 250 פיצות מבוקשות, ללא תוספת משאבים או תוספת מחיר."
+    if day_type == "Busy Thursday":
+        return (
+            "יום חמישי עמוס: 450 פיצות מבוקשות. מדיניות השיא יכולה להפעיל 2 תאי תנור "
+            "זמניים, עובד אריזה נוסף ותוספת מחיר של 10%, כדי להגן על ה־SLA ולממן "
+            "את קיבולת השיא."
+        )
+    return (
+        f"אירוע עירוני: {requested} פיצות מבוקשות, אך המלאי היומי מוגבל ל־"
+        f"{DAILY_PIZZA_CAPACITY}; לכן 100 פיצות נדחות והמערכת משווה בין שתי דרכי בחירה "
+        "של 500 הפיצות שאפשר לייצר. מדיניות האירוע מוסיפה טבח זמני ותוספת מחיר של 15%."
+    )
+
+
+def current_result_answer(day_type: str, result: dict[str, Any]) -> str:
+    """Explain only metrics that were actually calculated by the simulation."""
     fifo = result["fifo"]
     ai = result["ai"]
-    model = os.getenv("PIZZAFLOW_MODEL", "gpt-4o-mini")
-    context = {
-        "scenario": day_type,
-        "profit_improvement_percent": round(result["profit_improvement"], 2),
-        "fifo_adjusted_net_profit": round(fifo["adjusted_net"], 2),
-        "pizzaflow_adjusted_net_profit": round(ai["adjusted_net"], 2),
-        "fifo_on_time_percent": round(fifo["on_time_rate"], 2),
-        "pizzaflow_on_time_percent": round(ai["on_time_rate"], 2),
-        "delivery_time_improvement_percent": round(result["eta_improvement"], 2),
-        "compensation_percent": round(ai["compensation_rate"], 2),
-        "full_refund_percent": round(ai["full_refund_rate"], 2),
-        "peak_surcharge": round(ai["event_surcharge_total"], 2),
-        "extra_chefs": ai["extra_chefs"],
-        "temporary_oven_chambers": ai["extra_oven_chambers"],
-        "extra_packers": ai["extra_packers"],
-    }
-    # Streamlit deployments may expose an ASCII default locale. Encoding the
-    # request payload as JSON with standard Unicode escapes keeps Hebrew input
-    # safe while preserving its exact meaning for the model.
-    request_payload = json.dumps(
-        {"manager_question": question, "simulation_facts": context},
-        ensure_ascii=True,
+    selected = result["selected_label"]
+    improvement = result["profit_improvement"]
+    improvement_text = (
+        f"שיפור של {improvement:.1f}% ברווח הנקי המתואם"
+        if fifo["adjusted_net"] > 0
+        else f"פער של {money(result['profit_delta'])} מול בסיס FIFO"
     )
-    instructions = (
-        "You are the managerial explanation layer of PizzaFlow AI. "
-        "Use only the supplied simulation facts. Do not invent orders, costs, "
-        "KPIs, or operational results. Explain the trade-off between service "
-        "and profitability in clear Hebrew. Give a short recommendation, "
-        "one risk or limitation, and one human approval step. Never claim "
-        "that you changed the schedule or executed an action."
+    return (
+        f"**תוצאות {day_type}:**\n\n"
+        f"• PizzaFlow: רווח נקי מתואם {money(ai['adjusted_net'])}, "
+        f"עמידה ב־SLA של {ai['on_time_rate']:.1f}%, זמן ממוצע {ai['avg_eta']:.1f} דקות.\n"
+        f"• FIFO: רווח נקי מתואם {money(fifo['adjusted_net'])}, "
+        f"עמידה ב־SLA של {fifo['on_time_rate']:.1f}%, זמן ממוצע {fifo['avg_eta']:.1f} דקות.\n"
+        f"• ההשוואה: {improvement_text}; שיפור זמן האספקה הוא {result['eta_improvement']:.1f}%.\n"
+        f"• פיצויים ב־PizzaFlow: {ai['compensation_rate']:.2f}% מההזמנות; "
+        f"החזרים מלאים: {ai['full_refund_rate']:.2f}%.\n"
+        f"• מדיניות התזמון שנבחרה: **{selected}**.\n\n"
+        "המלצה: להשתמש בתוצאה כבסיס להחלטה, אבל לבדוק אנושית את עלות התוספת "
+        "והאם הביקוש בפועל דומה להנחות הסימולציה."
     )
-    user_input = (
-        "The JSON below contains standard Unicode escape sequences. "
-        "Interpret the escaped Hebrew text before answering.\n"
-        f"JSON payload: {request_payload}\n"
-        "Answer in Hebrew with three short sections: recommendation, "
-        "risk/limitation, human approval."
-    )
-    body = json.dumps(
-        {"model": model, "instructions": instructions, "input": user_input},
-        ensure_ascii=True,
-    ).encode("ascii")
-    request = urllib.request.Request(
-        "https://api.openai.com/v1/responses",
-        data=body,
-        headers={
-            "Authorization": f"Bearer {openai_api_key()}",
-            "Content-Type": "application/json; charset=utf-8",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=60) as response:
-            response_data = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"OpenAI API HTTP {exc.code}: {detail[:500]}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"OpenAI API connection failed: {exc.reason}") from exc
 
-    output_text = response_data.get("output_text")
-    if output_text:
-        return output_text
-    for item in response_data.get("output", []):
-        for content in item.get("content", []):
-            if content.get("type") == "output_text" and content.get("text"):
-                return content["text"]
-    raise RuntimeError("OpenAI returned no text output.")
+
+def infer_day_type(question: str, fallback: str) -> str:
+    """Infer a scenario named in the question, while keeping the UI choice as fallback."""
+    if any(marker in question for marker in ("אירוע", "600", "city event", "event")):
+        return "City event Thursday"
+    if any(marker in question for marker in ("חמישי", "450", "busy thursday", "busy")):
+        return "Busy Thursday"
+    if any(marker in question for marker in ("ראשון", "250", "weak sunday", "sunday")):
+        return "Weak Sunday"
+    if any(marker in question for marker in ("רגיל", "350", "regular day", "regular")):
+        return "Regular day"
+    return fallback
+
+
+def local_manager_answer(
+    question: str,
+    day_type: str,
+    result: dict[str, Any] | None = None,
+) -> str:
+    """Answer manager questions locally from the project specification.
+
+    This is intentionally not presented as a general-purpose language model.
+    It uses intent matching and grounded response templates, so it remains
+    free, deterministic, auditable, and safe for a public demo.
+    """
+    question = question.strip()
+    normalized = normalize_question(question)
+    if not normalized:
+        return "כתוב שאלה על המערכת, על התרחיש או על תוצאות ההשוואה."
+    question_day_type = infer_day_type(normalized, day_type)
+
+    intent_keywords = {
+        "results": [
+            "תוצאה", "השוואה", "fifo", "שיפור", "כמה הרווח", "כמה יצא",
+            "כדאי", "המלצה", "on time", "עמידה", "performance", "compare",
+        ],
+        "objective": ["מטרה", "objective", "למקסם", "רווחיות", "adjusted net profit"],
+        "algorithm": [
+            "אלגוריתם", "תיעדוף", "priority", "priorit", "profit / eta",
+            "profit eta", "נוסחה", "דירוג", "איך נבחרת הזמנה",
+        ],
+        "ai_role": [
+            "מה התפקיד של ai", "תפקיד ה ai", "תפקיד ai", "מה עושה ai", "בינה מלאכותית",
+            "רכיב ai", "מנוע ai", "artificial intelligence", "איך ai עובד", "גנרטיבי",
+            "generative",
+        ],
+        "timing": [
+            "זמן", "eta", "sla", "40", "הכנה", "אפייה", "אריזה", "טיסה",
+            "איחור", "delivery", "דקות",
+        ],
+        "capacity": [
+            "מלאי", "500", "capacity", "סגירת", "נדחות", "דחייה", "כמה אפשר",
+            "קיבולת",
+        ],
+        "staff": [
+            "עובד", "עובדים", "טבח", "טבחים", "שכר", "chef", "packer",
+            "loader", "טכנאי", "משמרת", "שלישי",
+        ],
+        "ovens": ["תנור", "תנורים", "תאים", "oven", "חימום", "chamber"],
+        "drones": [
+            "רחפן", "רחפנים", "drone", "סוללה", "70", "15 קמ", "טיסות",
+            "מהירות",
+        ],
+        "pricing": [
+            "מחיר", "עלות", "תוספת", "שתייה", "פחית", "בקבוק", "מס", "שכירות",
+            "חשמל", "הכנסה", "revenue", "cost",
+        ],
+        "scenarios": [
+            "רגיל", "חלש", "ראשון", "חמישי", "אירוע", "350", "250", "450", "600",
+            "scenario",
+        ],
+        "compensation": [
+            "פיצוי", "החזר", "refund", "compensation", "איחור", "45", "60", "70",
+        ],
+        "kpi": ["kpi", "98", "15%", "10%", "1%", "0.1", "יעד"],
+        "responsible": [
+            "אחריות", "סיכון", "responsible", "הטיה", "מגבלה", "אדם", "אנושי",
+            "הסבר", "explain",
+        ],
+        "specification": [
+            "הגדרות", "מפרט", "מערכת", "specification", "assumption", "הנחות",
+        ],
+    }
+    scores = {
+        intent: sum(1 for keyword in keywords if keyword in normalized)
+        for intent, keywords in intent_keywords.items()
+    }
+
+    comparison_markers = (
+        "fifo", "השוואה", "שיפור", "תוצאה", "כמה יצא", "כדאי", "יתרון", "רווח",
+        "האם כדאי", "ביצועים",
+    )
+    if result is not None and any(marker in normalized for marker in comparison_markers):
+        return current_result_answer(day_type, result)
+
+    best_intent, best_score = max(scores.items(), key=lambda item: item[1])
+    if best_score == 0:
+        return (
+            "אני המנוע המקומי של PizzaFlow AI. אני יכול לענות על: מטרת המערכת, "
+            "האלגוריתם, SLA וזמני ייצור, עובדים ושכר, תנורים, רחפנים, מלאי, "
+            "תמחור, תרחישים, KPI, פיצויים ו־Responsible AI. "
+            "נסה לנסח את השאלה באחד מהנושאים האלה."
+        )
+
+    if best_intent == "objective":
+        return (
+            "מטרת PizzaFlow AI היא למקסם **Adjusted Net Profit** תוך עמידה ב־SLA "
+            "של עד 40 דקות. המנוע מתחשב במלאי של 500 פיצות ביום, בכוח האדם, "
+            "בקיבולת התנורים ובקיבולת הרחפנים."
+        )
+    if best_intent == "algorithm":
+        return (
+            "לכל הזמנה מחושבים Revenue, עלות חומרי גלם, Profit ו־ETA.\n\n"
+            "**ETA = הכנה + אפייה + אריזה + טיסה**\n\n"
+            "**Priority = Profit / ETA**\n\n"
+            "המנוע משווה כמה רצפים שקופים, כולל FIFO, Profit/ETA ורצף המגן על ה־SLA. "
+            "הקריטריון הראשון הוא עמידה ב־40 דקות; לאחר מכן נבחר הרווח הנקי המתואם הגבוה יותר."
+        )
+    if best_intent == "ai_role":
+        return (
+            "רכיב ה־AI המרכזי הוא מנוע החלטה מקומי: הוא מדרג הזמנות, בוחן קבלה "
+            "כאשר הביקוש עובר 500 פיצות, משווה רצפי ייצור ומאזן בין רווח לבין זמן אספקה. "
+            "בנוסף יש כאן עוזר שאלות מקומי שמחזיר תשובות grounded מהמפרט ומהסימולציה. "
+            "אין שימוש ב־OpenAI, אין מפתח API ואין שליחת נתונים החוצה. זהו מנוע AI "
+            "מסביר/היוריסטי, לא מודל שפה גנרטיבי כללי."
+        )
+    if best_intent == "timing":
+        return (
+            "זמן ההזמנה מחושב כך: הכנה = 2 דקות בסיס + דקה לכל תוספת; אפייה = 7 דקות; "
+            "אריזה = דקה; טיסה מחושבת לפי המרחק ומהירות הרחפן. יעד ה־SLA הוא עד 40 דקות. "
+            "המערכת בודקת את הזמן בפועל לאחר תורים אצל טבחים, תנורים, אריזה ורחפנים."
+        )
+    if best_intent == "capacity":
+        return (
+            f"המלאי היומי הוא {DAILY_PIZZA_CAPACITY} פיצות. ביום רגיל הביקוש הוא 350, "
+            "בחמישי עמוס 450, ובאירוע עירוני 600. באירוע העירוני המערכת מקבלת רק "
+            f"{DAILY_PIZZA_CAPACITY} פיצות ודוחה את 100 הנותרות; היא משווה בין FIFO "
+            "לבין בחירה לפי ערך עסקי."
+        )
+    if best_intent == "staff":
+        return (
+            f"מצבת הבסיס היא {CHEFS_NORMAL} טבחים, עובד אריזה אחד, מעמיס רחפנים אחד "
+            f"וטכנאי סוללות אחד. ביום שלישי יש {CHEFS_TUESDAY} טבחים. המשמרת היא "
+            f"12:00–01:00, כלומר {SHIFT_HOURS} שעות. השכר לשעה: טבח {HOURLY_WAGES['Chef']} ₪, "
+            f"אריזה {HOURLY_WAGES['Packer']} ₪, מעמיס {HOURLY_WAGES['Drone loader']} ₪, "
+            f"טכנאי {HOURLY_WAGES['Battery technician']} ₪."
+        )
+    if best_intent == "ovens":
+        return (
+            "Oven A כולל 3 תאים ו־Oven B כולל 2 תאים; שניהם פעילים תמיד. Oven C כולל תא אחד, "
+            "דורש 5 דקות חימום ועולה 10 ₪ לכל פיצה, ולכן הוא מופעל רק כשמדיניות העומס "
+            "מצדיקה זאת."
+        )
+    if best_intent == "drones":
+        return (
+            f"במערכת יש {DRONE_COUNT} רחפנים, במהירות {DRONE_SPEED_KMH} קמ״ש ובטווח של "
+            f"{DRONE_RANGE_KM} ק״מ. אחרי {DRONE_FLIGHTS_BEFORE_BATTERY} טיסות רחפן מושבת "
+            f"ל־{DRONE_BATTERY_MINUTES} דקות להחלפת סוללה. הרחפן הראשון חינם; רחפן נוסף "
+            f"מחויב ב־{SECOND_DRONE_SURCHARGE} ₪ ללקוח."
+        )
+    if best_intent == "pricing":
+        return (
+            f"מחיר בסיס לפיצה הוא {PIZZA_PRICE} ₪, תוספת עולה {TOPPING_PRICE} ₪, פחית "
+            f"{DRINK_PRICE['Can']} ₪ ובקבוק גדול {DRINK_PRICE['Large Bottle']} ₪. עלויות "
+            f"החומרים הן בצק {DOUGH_COST} ₪, גבינה ורוטב {CHEESE_SAUCE_COST} ₪, ותוספת "
+            f"{TOPPING_COST} ₪. בנוסף מחושבים שכר, שכירות, חשמל, מס של {TAX_RATE:.0%}, "
+            "פיצויים ועלות Oven C."
+        )
+    if best_intent == "scenarios":
+        return scenario_description(question_day_type)
+    if best_intent == "compensation":
+        return (
+            "מדיניות הפיצוי מבוססת על ה־SLA של 40 דקות: עד 40 דקות אין פיצוי; "
+            "בין 40 ל־60 דקות יש פיצוי של 10 ₪; בין 60 ל־70 דקות 30 ₪; מעל 70 דקות "
+            "יש החזר מלא והלקוח שומר את ההזמנה. העלויות האלה נכנסות לחישוב Adjusted Net Profit."
+        )
+    if best_intent == "kpi":
+        return (
+            "ה־KPI שהוגדרו הם: 98% מההזמנות עד 40 דקות; שיפור רווח מול FIFO; "
+            "שיפור של 10% בזמן האספקה; פחות מ־1% הזמנות עם פיצוי; ופחות מ־0.1% "
+            "החזרים מלאים. בגרסה הנוכחית יעדי השיפור לתרחישים מוצגים בנפרד: קטן ביום רגיל, "
+            "כ־10% בחמישי, ו־16%–20% באירוע עירוני."
+        )
+    if best_intent == "responsible":
+        return (
+            "הסיכונים העיקריים הם הסתמכות על הנחות סימולציה, הטיה לטובת הזמנות רווחיות, "
+            "אי־דיוק בתחזית הביקוש, ושימוש בנתונים שאינם מייצגים. לכן המערכת מסבירה את "
+            "הנוסחה וההנחות, לא מבצעת פעולה אמיתית, והחלטה אנושית נדרשת לפני שינוי תפעולי."
+        )
+    if best_intent == "specification":
+        return (
+            f"{scenario_description(day_type)} מטרת המערכת היא למקסם רווח נקי מתואם תחת "
+            "SLA של 40 דקות, מלאי של 500 פיצות, מגבלות טבחים, תנורים ורחפנים. "
+            "היא כוללת מסך הזמנות, תרחישים, Dashboard, השוואת FIFO, KPI, מנוע תיעדוף "
+            "והסבר Responsible AI."
+        )
+
+    if result is not None:
+        return current_result_answer(day_type, result)
+    return scenario_description(question_day_type)
 
 
 def compensation(delivery_minutes: float, revenue: float) -> tuple[float, str]:
@@ -646,14 +809,13 @@ if "evaluation" not in st.session_state:
     st.session_state.evaluation = None
 if "tuesday" not in st.session_state:
     st.session_state.tuesday = False
+if "assistant_answer" not in st.session_state:
+    st.session_state.assistant_answer = ""
 
 
 st.title("🍕 PizzaFlow AI")
 st.caption("Explainable decision-support for a dark kitchen with autonomous drone delivery")
-if openai_api_key():
-    st.info("Local optimization engine + Generative AI manager layer active.")
-else:
-    st.info("Local transparent optimization engine active. Add OPENAI_API_KEY in Streamlit Secrets to enable the Generative AI manager layer.")
+st.info("Local AI optimization engine + grounded manager assistant active. No API key, external service, or payment is required.")
 
 tab_orders, tab_dashboard, tab_method = st.tabs(["🍕 Orders", "📊 Dashboard", "🛡 Method & Responsible AI"])
 
@@ -698,6 +860,7 @@ with tab_dashboard:
             st.session_state.day_type = day_type
             st.session_state.tuesday = tuesday
             st.session_state.evaluation = None
+            st.session_state.assistant_answer = ""
             accepted_pizzas = sum(int(x["PizzaCount"]) for x in st.session_state.orders)
             st.success(f"Loaded {accepted_pizzas} accepted pizzas in {len(st.session_state.orders)} orders. Rejected pizzas after capacity: {rejected}.")
     with c4:
@@ -705,6 +868,7 @@ with tab_dashboard:
             st.session_state.orders = []
             st.session_state.requested_orders = []
             st.session_state.evaluation = None
+            st.session_state.assistant_answer = ""
             st.rerun()
 
     if not st.session_state.orders:
@@ -725,6 +889,7 @@ with tab_dashboard:
                 st.session_state.requested_orders,
                 st.session_state.day_type,
             )
+            st.session_state.assistant_answer = ""
 
         result = st.session_state.evaluation
         if result:
@@ -820,36 +985,25 @@ with tab_dashboard:
             st.subheader("Business Outcome")
             st.dataframe(ai["details"].head(30), use_container_width=True)
 
-            st.subheader("🧠 Generative AI Manager Copilot")
+            st.subheader("🧠 Local AI Manager Assistant")
             st.caption(
-                "The Generative AI layer explains the measured simulation results in natural language. "
-                "It does not alter orders, KPIs, prices, or schedules."
+                "Ask questions in Hebrew or English. The assistant answers locally from the PizzaFlow "
+                "specification and the measured scenario; it does not alter orders, KPIs, prices, or schedules."
             )
             manager_question = st.text_area(
                 "Manager question",
                 value="האם כדאי להפעיל את מדיניות השיא בתרחיש הזה, ומה הסיכון המרכזי?",
                 key="manager_question",
             )
-            if st.button("🧠 Generate managerial recommendation"):
-                if not openai_api_key():
-                    st.warning(
-                        "Generative AI is ready but not connected. Add OPENAI_API_KEY "
-                        "under Streamlit Settings → Secrets and reboot the app."
-                    )
-                elif not manager_question.strip():
-                    st.warning("Please enter a managerial question.")
-                else:
-                    try:
-                        with st.spinner("Generating grounded recommendation..."):
-                            advice = generate_manager_advice(
-                                manager_question,
-                                st.session_state.day_type,
-                                result,
-                            )
-                    except Exception as exc:
-                        st.error(f"Generative AI request failed: {exc}")
-                    else:
-                        st.markdown(advice)
+            if st.button("🧠 Ask the local assistant"):
+                st.session_state.assistant_answer = local_manager_answer(
+                    manager_question,
+                    st.session_state.day_type,
+                    result,
+                )
+            if st.session_state.assistant_answer:
+                st.markdown(st.session_state.assistant_answer)
+                st.caption("מקור התשובה: מפרט PizzaFlow ותוצאות הסימולציה המקומית; אין חיבור למודל חיצוני.")
 
 with tab_method:
     st.header("Method & Responsible AI")
@@ -860,9 +1014,9 @@ with tab_method:
 
 **Resources:** 3 chefs normally (2 on Tuesday), 1 packer, 1 drone loader, 1 battery technician, Oven A with 3 chambers, Oven B with 2, and Oven C with 1 chamber that needs 5 minutes warm-up and costs 10 ₪ per pizza. Under the approved option 2 peak policy, PizzaFlow can activate temporary peak capacity and a transparent peak surcharge; those additions are shown in the dashboard and included in net profit.
 
-**Responsible AI:** The current deployment is a transparent local fallback. It uses only the supplied order fields, does not invent order IDs, and exposes its assumptions. A human remains responsible for operational decisions.
+**Responsible AI:** The current deployment is a transparent local system. It uses only the supplied order fields, does not invent order IDs, and exposes its assumptions. A human remains responsible for operational decisions.
 
-**Generative AI layer:** When `OPENAI_API_KEY` is configured, the manager copilot uses the OpenAI Responses API to explain the measured simulation results in Hebrew. It receives only aggregated scenario metrics, cannot change the simulation, and requires human approval before any operational action. API keys are stored in Streamlit Secrets and are not included in the source code.
+**Local manager assistant:** The assistant uses local intent matching and grounded response templates over the project specification and the current simulation output. It requires no API key, sends no data outside the app, cannot change the simulation, and is not presented as a general-purpose generative language model. This makes the public prototype reproducible at zero service cost.
 """)
     st.subheader("Operating assumptions")
     st.json({
