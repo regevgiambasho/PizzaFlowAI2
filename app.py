@@ -10,6 +10,8 @@ import math
 import json
 import os
 import random
+import urllib.error
+import urllib.request
 from typing import Any
 
 import pandas as pd
@@ -130,12 +132,9 @@ def generate_manager_advice(
     result: dict[str, Any],
 ) -> str:
     """Generate a grounded managerial explanation from the simulation output."""
-    from openai import OpenAI
-
     fifo = result["fifo"]
     ai = result["ai"]
     model = os.getenv("PIZZAFLOW_MODEL", "gpt-4o-mini")
-    client = OpenAI(api_key=openai_api_key())
     context = {
         "scenario": day_type,
         "profit_improvement_percent": round(result["profit_improvement"], 2),
@@ -158,25 +157,51 @@ def generate_manager_advice(
         {"manager_question": question, "simulation_facts": context},
         ensure_ascii=True,
     )
-    response = client.responses.create(
-        model=model,
-        instructions=(
-            "You are the managerial explanation layer of PizzaFlow AI. "
-            "Use only the supplied simulation facts. Do not invent orders, costs, "
-            "KPIs, or operational results. Explain the trade-off between service "
-            "and profitability in clear Hebrew. Give a short recommendation, "
-            "one risk or limitation, and one human approval step. Never claim "
-            "that you changed the schedule or executed an action."
-        ),
-        input=(
-            "The JSON below contains standard Unicode escape sequences. "
-            "Interpret the escaped Hebrew text before answering.\n"
-            f"JSON payload: {request_payload}\n"
-            "Answer in Hebrew with three short sections: recommendation, "
-            "risk/limitation, human approval."
-        ),
+    instructions = (
+        "You are the managerial explanation layer of PizzaFlow AI. "
+        "Use only the supplied simulation facts. Do not invent orders, costs, "
+        "KPIs, or operational results. Explain the trade-off between service "
+        "and profitability in clear Hebrew. Give a short recommendation, "
+        "one risk or limitation, and one human approval step. Never claim "
+        "that you changed the schedule or executed an action."
     )
-    return response.output_text
+    user_input = (
+        "The JSON below contains standard Unicode escape sequences. "
+        "Interpret the escaped Hebrew text before answering.\n"
+        f"JSON payload: {request_payload}\n"
+        "Answer in Hebrew with three short sections: recommendation, "
+        "risk/limitation, human approval."
+    )
+    body = json.dumps(
+        {"model": model, "instructions": instructions, "input": user_input},
+        ensure_ascii=True,
+    ).encode("ascii")
+    request = urllib.request.Request(
+        "https://api.openai.com/v1/responses",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {openai_api_key()}",
+            "Content-Type": "application/json; charset=utf-8",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            response_data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"OpenAI API HTTP {exc.code}: {detail[:500]}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"OpenAI API connection failed: {exc.reason}") from exc
+
+    output_text = response_data.get("output_text")
+    if output_text:
+        return output_text
+    for item in response_data.get("output", []):
+        for content in item.get("content", []):
+            if content.get("type") == "output_text" and content.get("text"):
+                return content["text"]
+    raise RuntimeError("OpenAI returned no text output.")
 
 
 def compensation(delivery_minutes: float, revenue: float) -> tuple[float, str]:
@@ -821,9 +846,10 @@ with tab_dashboard:
                                 st.session_state.day_type,
                                 result,
                             )
-                        st.markdown(advice)
                     except Exception as exc:
                         st.error(f"Generative AI request failed: {exc}")
+                    else:
+                        st.markdown(advice)
 
 with tab_method:
     st.header("Method & Responsible AI")
