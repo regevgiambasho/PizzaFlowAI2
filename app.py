@@ -33,8 +33,8 @@ DEMAND_BY_DAY = {
 PEAK_SHARE = {
     "Regular day": 0.35,
     "Weak Sunday": 0.25,
-    "Busy Thursday": 0.60,
-    "City event Thursday": 0.80,
+    "Busy Thursday": 0.70,
+    "City event Thursday": 0.85,
 }
 PEAK_START = 18 * 60
 PEAK_END = 22 * 60
@@ -251,11 +251,15 @@ def simulate(orders: list[dict[str, Any]], sequence: list[int], tuesday: bool) -
 
         # Select the oven that finishes earliest. Oven C includes its warm-up
         # when it is needed and incurs its stated per-pizza cost.
+        # A chamber can bake several pizzas from the same order in one batch;
+        # each additional pizza adds handling/load time without multiplying the
+        # full seven-minute bake cycle.
+        baking_duration = order["BakingMinutes"] + max(0, order["PizzaCount"] - 1) * 2
         oven_options = []
         for oven in ovens:
             start = max(prep_finish, oven["available"])
             warmup = OVEN_C_WARMUP if oven["name"] == "Oven C" else 0
-            oven_options.append((start + warmup + order["BakingMinutes"], start, warmup, oven))
+            oven_options.append((start + warmup + baking_duration, start, warmup, oven))
         finish, oven_start, warmup, oven = min(oven_options, key=lambda x: (x[0], x[3]["name"]))
         oven["available"] = finish
         baking_finish = finish
@@ -323,13 +327,14 @@ def run_evaluation(orders: list[dict[str, Any]], tuesday: bool) -> dict[str, Any
     fifo = next(result for label, sequence, result in candidates if label == "FIFO")
 
     # The local optimizer evaluates the same orders and resources under every
-    # candidate schedule. FIFO is always included, so the selected schedule
-    # can never underperform the baseline on adjusted net profit.
+    # candidate schedule. SLA protection is the first decision criterion;
+    # adjusted net profit is used as the tie-breaker. FIFO is always included,
+    # so the AI cannot claim an SLA improvement by making service worse.
     selected_label, ai_sequence, ai = max(
         candidates,
         key=lambda item: (
-            item[2]["adjusted_net"],
             item[2]["on_time_rate"],
+            item[2]["adjusted_net"],
             -item[2]["compensation_rate"],
             -item[2]["avg_eta"],
         ),
@@ -337,11 +342,13 @@ def run_evaluation(orders: list[dict[str, Any]], tuesday: bool) -> dict[str, Any
     safety_fallback = selected_label == "FIFO"
     profit_improvement = ((ai["adjusted_net"] - fifo["adjusted_net"]) / abs(fifo["adjusted_net"]) * 100) if fifo["adjusted_net"] else 0
     eta_improvement = ((fifo["avg_eta"] - ai["avg_eta"]) / fifo["avg_eta"] * 100) if fifo["avg_eta"] else 0
+    on_time_advantage = ai["on_time_rate"] - fifo["on_time_rate"]
     return {
         "fifo": fifo,
         "ai": ai,
         "profit_improvement": profit_improvement,
         "eta_improvement": eta_improvement,
+        "on_time_advantage": on_time_advantage,
         "sequence": ai_sequence,
         "safety_fallback": safety_fallback,
         "selected_label": selected_label,
@@ -456,6 +463,18 @@ with tab_dashboard:
             k4.caption(f"{kpi_status(ai['compensation_rate'], 1, False)} מקסימום: 1%")
             k5.metric("Full refunds", f"{ai['full_refund_rate']:.2f}%", delta_color="off")
             k5.caption(f"{kpi_status(ai['full_refund_rate'], 0.1, False)} מקסימום: 0.1%")
+
+            if result["on_time_advantage"] > 0:
+                st.success(
+                    f"🚀 יתרון PizzaFlow AI מול FIFO: "
+                    f"+{result['on_time_advantage']:.1f} נקודות אחוז בהזמנות שסופקו בתוך 40 דקות."
+                )
+            elif result["on_time_advantage"] < 0:
+                st.warning(
+                    f"FIFO השיג יתרון של {abs(result['on_time_advantage']):.1f} נקודות אחוז בעמידה ב־SLA בתרחיש זה."
+                )
+            else:
+                st.info("PizzaFlow AI ו־FIFO השיגו אותה עמידה ב־SLA בתרחיש זה.")
 
             st.subheader("FIFO vs PizzaFlow AI")
             if result["safety_fallback"]:
