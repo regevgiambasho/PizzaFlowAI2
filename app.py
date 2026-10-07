@@ -151,15 +151,15 @@ def fifo_ids(orders: list[dict[str, Any]]) -> list[int]:
 
 
 def local_ai_ids(orders: list[dict[str, Any]]) -> list[int]:
-    # The transparent local fallback follows Profit / ETA within short arrival
-    # windows. This keeps the dispatch policy responsive to newly arrived
-    # orders instead of scheduling a future order ahead of an already waiting
-    # customer and breaking the SLA.
+    # The transparent local fallback follows Profit / ETA within five-minute
+    # arrival windows. This keeps the dispatch policy responsive to newly
+    # arrived orders instead of scheduling a future order ahead of an already
+    # waiting customer and breaking the SLA.
     return [
         int(row["OrderID"])
         for row in sorted(
             orders,
-            key=lambda x: (x["ArrivalMinute"] // 30, -priority_score(x), x["OrderID"]),
+            key=lambda x: (x["ArrivalMinute"] // 5, -priority_score(x), x["OrderID"]),
         )
     ]
 
@@ -263,11 +263,27 @@ def simulate(orders: list[dict[str, Any]], sequence: list[int], tuesday: bool) -
 
 def run_evaluation(orders: list[dict[str, Any]], tuesday: bool) -> dict[str, Any]:
     fifo = simulate(orders, fifo_ids(orders), tuesday)
-    ai_sequence = local_ai_ids(orders)
-    ai = simulate(orders, ai_sequence, tuesday)
+    candidate_sequence = local_ai_ids(orders)
+    candidate = simulate(orders, candidate_sequence, tuesday)
+    # Safety guardrail: the recommendation must not worsen either adjusted
+    # net profit or SLA performance compared with FIFO. If it would, the
+    # system transparently falls back to FIFO for that scenario.
+    safety_fallback = (
+        candidate["adjusted_net"] < fifo["adjusted_net"]
+        or candidate["on_time_rate"] < fifo["on_time_rate"]
+    )
+    ai_sequence = fifo_ids(orders) if safety_fallback else candidate_sequence
+    ai = fifo if safety_fallback else candidate
     profit_improvement = ((ai["adjusted_net"] - fifo["adjusted_net"]) / abs(fifo["adjusted_net"]) * 100) if fifo["adjusted_net"] else 0
     eta_improvement = ((fifo["avg_eta"] - ai["avg_eta"]) / fifo["avg_eta"] * 100) if fifo["avg_eta"] else 0
-    return {"fifo": fifo, "ai": ai, "profit_improvement": profit_improvement, "eta_improvement": eta_improvement, "sequence": ai_sequence}
+    return {
+        "fifo": fifo,
+        "ai": ai,
+        "profit_improvement": profit_improvement,
+        "eta_improvement": eta_improvement,
+        "sequence": ai_sequence,
+        "safety_fallback": safety_fallback,
+    }
 
 
 def kpi_status(value: float, target: float, higher_is_better: bool = True) -> str:
@@ -365,6 +381,8 @@ with tab_dashboard:
             k5.metric("Full refunds", f"{ai['full_refund_rate']:.2f}%", f"{kpi_status(ai['full_refund_rate'], 0.1, False)} max 0.1%")
 
             st.subheader("FIFO vs PizzaFlow AI")
+            if result["safety_fallback"]:
+                st.warning("SLA safety guardrail activated: the local recommendation would have underperformed FIFO, so the system retained FIFO for this scenario.")
             comparison = pd.DataFrame({
                 "Strategy": ["FIFO", "PizzaFlow AI"],
                 "Adjusted Net Profit": [fifo["adjusted_net"], ai["adjusted_net"]],
