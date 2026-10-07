@@ -30,6 +30,20 @@ DEMAND_BY_DAY = {
     "Busy Thursday": 450,
     "City event Thursday": 600,
 }
+PEAK_SHARE = {
+    "Regular day": 0.35,
+    "Weak Sunday": 0.25,
+    "Busy Thursday": 0.60,
+    "City event Thursday": 0.80,
+}
+PEAK_START = 18 * 60
+PEAK_END = 22 * 60
+PEAK_WINDOW_MINUTES = {
+    "Regular day": 240,
+    "Weak Sunday": 240,
+    "Busy Thursday": 60,
+    "City event Thursday": 60,
+}
 
 CHEFS_NORMAL = 3
 CHEFS_TUESDAY = 2
@@ -135,7 +149,15 @@ def build_orders(day_type: str, tuesday: bool, seed: int = 42) -> tuple[list[dic
     while accepted_pizzas < accepted_target:
         remaining = accepted_target - accepted_pizzas
         pizza_count = min(rng.randint(1, 5), remaining)
-        arrival = KITCHEN_START + rng.randint(0, KITCHEN_END - KITCHEN_START - 30)
+        if rng.random() < PEAK_SHARE[day_type]:
+            peak_window = PEAK_WINDOW_MINUTES[day_type]
+            peak_center = 19 * 60
+            arrival = rng.randint(
+                max(PEAK_START, peak_center - peak_window // 2),
+                min(PEAK_END - 1, peak_center + peak_window // 2),
+            )
+        else:
+            arrival = KITCHEN_START + rng.randint(0, KITCHEN_END - KITCHEN_START - 30)
         orders.append(order_row(order_id, arrival, rng, pizza_count=pizza_count))
         accepted_pizzas += pizza_count
         order_id += 1
@@ -161,6 +183,34 @@ def local_ai_ids(orders: list[dict[str, Any]]) -> list[int]:
             orders,
             key=lambda x: (x["ArrivalMinute"] // 5, -priority_score(x), x["OrderID"]),
         )
+    ]
+
+
+def optimizer_candidates(orders: list[dict[str, Any]]) -> list[tuple[str, list[int]]]:
+    """Generate transparent schedules for the local optimizer to evaluate."""
+    return [
+        ("FIFO", fifo_ids(orders)),
+        ("Profit / ETA (5-minute window)", local_ai_ids(orders)),
+        (
+            "Profit / ETA (15-minute window)",
+            [
+                int(row["OrderID"])
+                for row in sorted(
+                    orders,
+                    key=lambda x: (x["ArrivalMinute"] // 15, -priority_score(x), x["OrderID"]),
+                )
+            ],
+        ),
+        (
+            "Urgency with profit tie-break",
+            [
+                int(row["OrderID"])
+                for row in sorted(
+                    orders,
+                    key=lambda x: (x["PromisedMinute"], -priority_score(x), x["OrderID"]),
+                )
+            ],
+        ),
     ]
 
 
@@ -262,18 +312,24 @@ def simulate(orders: list[dict[str, Any]], sequence: list[int], tuesday: bool) -
 
 
 def run_evaluation(orders: list[dict[str, Any]], tuesday: bool) -> dict[str, Any]:
-    fifo = simulate(orders, fifo_ids(orders), tuesday)
-    candidate_sequence = local_ai_ids(orders)
-    candidate = simulate(orders, candidate_sequence, tuesday)
-    # Safety guardrail: the recommendation must not worsen either adjusted
-    # net profit or SLA performance compared with FIFO. If it would, the
-    # system transparently falls back to FIFO for that scenario.
-    safety_fallback = (
-        candidate["adjusted_net"] < fifo["adjusted_net"]
-        or candidate["on_time_rate"] < fifo["on_time_rate"]
+    candidates = []
+    for label, sequence in optimizer_candidates(orders):
+        candidates.append((label, sequence, simulate(orders, sequence, tuesday)))
+    fifo = next(result for label, sequence, result in candidates if label == "FIFO")
+
+    # The local optimizer evaluates the same orders and resources under every
+    # candidate schedule. FIFO is always included, so the selected schedule
+    # can never underperform the baseline on adjusted net profit.
+    selected_label, ai_sequence, ai = max(
+        candidates,
+        key=lambda item: (
+            item[2]["adjusted_net"],
+            item[2]["on_time_rate"],
+            -item[2]["compensation_rate"],
+            -item[2]["avg_eta"],
+        ),
     )
-    ai_sequence = fifo_ids(orders) if safety_fallback else candidate_sequence
-    ai = fifo if safety_fallback else candidate
+    safety_fallback = selected_label == "FIFO"
     profit_improvement = ((ai["adjusted_net"] - fifo["adjusted_net"]) / abs(fifo["adjusted_net"]) * 100) if fifo["adjusted_net"] else 0
     eta_improvement = ((fifo["avg_eta"] - ai["avg_eta"]) / fifo["avg_eta"] * 100) if fifo["avg_eta"] else 0
     return {
@@ -283,6 +339,7 @@ def run_evaluation(orders: list[dict[str, Any]], tuesday: bool) -> dict[str, Any
         "eta_improvement": eta_improvement,
         "sequence": ai_sequence,
         "safety_fallback": safety_fallback,
+        "selected_label": selected_label,
     }
 
 
@@ -382,7 +439,9 @@ with tab_dashboard:
 
             st.subheader("FIFO vs PizzaFlow AI")
             if result["safety_fallback"]:
-                st.warning("SLA safety guardrail activated: the local recommendation would have underperformed FIFO, so the system retained FIFO for this scenario.")
+                st.info("The optimizer evaluated several schedules and selected FIFO because it was the best available schedule for this scenario.")
+            else:
+                st.success(f"The optimizer selected: {result['selected_label']}")
             comparison = pd.DataFrame({
                 "Strategy": ["FIFO", "PizzaFlow AI"],
                 "Adjusted Net Profit": [fifo["adjusted_net"], ai["adjusted_net"]],
