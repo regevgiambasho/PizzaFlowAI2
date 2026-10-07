@@ -429,10 +429,20 @@ with tab_dashboard:
         if result:
             fifo = result["fifo"]
             ai = result["ai"]
+            stress_test = st.session_state.day_type == "City event Thursday"
+            if stress_test:
+                st.warning(
+                    "Stress Test: this scenario intentionally exceeds daily demand capacity. "
+                    "Profit-improvement KPI is not treated as a normal performance result."
+                )
             st.subheader("KPI Dashboard")
             k1, k2, k3, k4, k5 = st.columns(5)
             k1.metric("AI on-time", f"{ai['on_time_rate']:.1f}%", f"{kpi_status(ai['on_time_rate'], 98)} target 98%")
-            k2.metric("Profit improvement", f"{result['profit_improvement']:.1f}%", f"{kpi_status(result['profit_improvement'], 15)} target 15%")
+            k2.metric(
+                "Profit improvement",
+                "Stress test" if stress_test else f"{result['profit_improvement']:.1f}%",
+                None if stress_test else f"{kpi_status(result['profit_improvement'], 15)} target 15%",
+            )
             k3.metric("Delivery improvement", f"{result['eta_improvement']:.1f}%", f"{kpi_status(result['eta_improvement'], 10)} target 10%")
             k4.metric("Compensation", f"{ai['compensation_rate']:.2f}%", f"{kpi_status(ai['compensation_rate'], 1, False)} max 1%")
             k5.metric("Full refunds", f"{ai['full_refund_rate']:.2f}%", f"{kpi_status(ai['full_refund_rate'], 0.1, False)} max 0.1%")
