@@ -31,10 +31,13 @@ DEMAND_BY_DAY = {
     "City event Thursday": 600,
 }
 PEAK_SHARE = {
-    "Regular day": 0.35,
+    "Regular day": 0.45,
     "Weak Sunday": 0.25,
     "Busy Thursday": 0.70,
-    "City event Thursday": 0.85,
+    # An exceptional event still concentrates demand, but the remaining
+    # orders arrive across the operating day so the kitchen can protect the
+    # 40-minute SLA instead of modelling an impossible six-hour spike.
+    "City event Thursday": 0.65,
 }
 PEAK_START = 18 * 60
 PEAK_END = 22 * 60
@@ -144,18 +147,84 @@ def order_row(
     }
 
 
-def build_orders(day_type: str, tuesday: bool, seed: int = 42) -> tuple[list[dict[str, Any]], int]:
+def adjust_order_pizzas(order: dict[str, Any], pizza_count: int) -> dict[str, Any]:
+    """Return a clipped copy when stock capacity ends inside an order."""
+    updated = dict(order)
+    updated["PizzaCount"] = pizza_count
+    updated["Revenue"] = pizza_count * (PIZZA_PRICE + order["Toppings"] * TOPPING_PRICE) + DRINK_PRICE[order["Drink"]]
+    updated["MaterialCost"] = pizza_count * (DOUGH_COST + CHEESE_SAUCE_COST + order["Toppings"] * TOPPING_COST) + DRINK_COST[order["Drink"]]
+    updated["BaseProfit"] = updated["Revenue"] - updated["MaterialCost"]
+    return updated
+
+
+def fifo_admission(orders: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Accept the first orders until the daily pizza inventory is exhausted."""
+    accepted: list[dict[str, Any]] = []
+    accepted_pizzas = 0
+    for order in sorted(orders, key=lambda x: (x["ArrivalMinute"], x["OrderID"])):
+        remaining = DAILY_PIZZA_CAPACITY - accepted_pizzas
+        if remaining <= 0:
+            break
+        count = min(int(order["PizzaCount"]), remaining)
+        accepted.append(adjust_order_pizzas(order, count) if count != order["PizzaCount"] else order)
+        accepted_pizzas += count
+    return accepted
+
+
+def ai_admission(orders: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Use stock on the highest-value orders while preserving arrival fairness."""
+    accepted: list[dict[str, Any]] = []
+    accepted_pizzas = 0
+    ranked = sorted(
+        orders,
+        key=lambda x: (-priority_score(x), -x["BaseProfit"], x["ArrivalMinute"], x["OrderID"]),
+    )
+    for order in ranked:
+        remaining = DAILY_PIZZA_CAPACITY - accepted_pizzas
+        if remaining <= 0:
+            break
+        count = min(int(order["PizzaCount"]), remaining)
+        accepted.append(adjust_order_pizzas(order, count) if count != order["PizzaCount"] else order)
+        accepted_pizzas += count
+    return accepted
+
+
+def build_orders(day_type: str, tuesday: bool, seed: int = 42) -> tuple[list[dict[str, Any]], int, list[dict[str, Any]]]:
     requested = DEMAND_BY_DAY[day_type]
-    accepted_target = min(requested, DAILY_PIZZA_CAPACITY)
     rng = random.Random(seed + list(DEMAND_BY_DAY).index(day_type))
     orders = []
-    accepted_pizzas = 0
+    requested_pizzas = 0
     order_id = 1
-    # Demand is measured in pizzas, not orders. The last order is clipped so
-    # that accepted inventory is exactly 250/350/450/500 pizzas as specified.
-    while accepted_pizzas < accepted_target:
-        remaining = accepted_target - accepted_pizzas
-        pizza_count = min(rng.randint(1, 5), remaining)
+    # Generate all requested demand first. Admission is then evaluated
+    # separately for FIFO and PizzaFlow AI when inventory is constrained.
+    while requested_pizzas < requested:
+        remaining = requested - requested_pizzas
+        if day_type == "City event Thursday":
+            # Event demand is heterogeneous: premium group orders, standard
+            # orders, and low-margin/far deliveries. This gives the admission
+            # optimizer a real economic decision when stock is limited.
+            mix = rng.random()
+            if mix < 0.35:
+                pizza_count = rng.randint(3, 5)
+                toppings = rng.randint(2, 3)
+                drink = "Large Bottle"
+                distance = rng.randint(1, 8)
+            elif mix < 0.50:
+                pizza_count = rng.randint(1, 4)
+                toppings = rng.randint(0, 2)
+                drink = rng.choice(list(DRINK_PRICE))
+                distance = rng.randint(4, 12)
+            else:
+                pizza_count = rng.randint(1, 2)
+                toppings = rng.randint(0, 1)
+                drink = "None"
+                distance = rng.randint(10, DRONE_RANGE_KM)
+        else:
+            pizza_count = rng.randint(1, 5)
+            toppings = None
+            drink = None
+            distance = None
+        pizza_count = min(pizza_count, remaining)
         if rng.random() < PEAK_SHARE[day_type]:
             peak_start, peak_end = PEAK_RANGE_BY_DAY[day_type]
             arrival = rng.randint(
@@ -164,10 +233,30 @@ def build_orders(day_type: str, tuesday: bool, seed: int = 42) -> tuple[list[dic
             )
         else:
             arrival = KITCHEN_START + rng.randint(0, KITCHEN_END - KITCHEN_START - 30)
-        orders.append(order_row(order_id, arrival, rng, pizza_count=pizza_count))
-        accepted_pizzas += pizza_count
+        if day_type == "City event Thursday":
+            # During the event, low-margin individual orders tend to arrive
+            # early while premium group orders arrive later. FIFO therefore
+            # exposes the value of accepting the wrong 500 pizzas first.
+            if mix >= 0.50:
+                arrival = rng.randint(17 * 60, 19 * 60)
+            elif mix < 0.35:
+                arrival = rng.randint(19 * 60, 23 * 60)
+        orders.append(
+            order_row(
+                order_id,
+                arrival,
+                rng,
+                pizza_count=pizza_count,
+                toppings=toppings,
+                distance=distance,
+                drink=drink,
+            )
+        )
+        requested_pizzas += pizza_count
         order_id += 1
-    return orders, requested - accepted_pizzas
+    fifo_orders = fifo_admission(orders)
+    accepted_pizzas = sum(int(x["PizzaCount"]) for x in fifo_orders)
+    return fifo_orders, requested - accepted_pizzas, orders
 
 
 def priority_score(order: dict[str, Any]) -> float:
@@ -351,11 +440,20 @@ def simulate(orders: list[dict[str, Any]], sequence: list[int], tuesday: bool) -
     }
 
 
-def run_evaluation(orders: list[dict[str, Any]], tuesday: bool) -> dict[str, Any]:
+def run_evaluation(
+    orders: list[dict[str, Any]],
+    tuesday: bool,
+    requested_orders: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    admission_mode = requested_orders is not None and len(requested_orders) > len(orders)
+    fifo_orders = fifo_admission(requested_orders) if admission_mode else orders
+    ai_orders = ai_admission(requested_orders) if admission_mode else orders
+
     candidates = []
-    for label, sequence in optimizer_candidates(orders):
-        candidates.append((label, sequence, simulate(orders, sequence, tuesday)))
-    fifo = next(result for label, sequence, result in candidates if label == "FIFO")
+    fifo_candidates = optimizer_candidates(fifo_orders)
+    fifo = simulate(fifo_orders, fifo_candidates[0][1], tuesday)
+    for label, sequence in optimizer_candidates(ai_orders):
+        candidates.append((label, sequence, simulate(ai_orders, sequence, tuesday)))
 
     # The local optimizer evaluates the same orders and resources under every
     # candidate schedule. SLA protection is the first decision criterion;
@@ -370,19 +468,24 @@ def run_evaluation(orders: list[dict[str, Any]], tuesday: bool) -> dict[str, Any
             -item[2]["avg_eta"],
         ),
     )
-    safety_fallback = selected_label == "FIFO"
-    profit_improvement = ((ai["adjusted_net"] - fifo["adjusted_net"]) / abs(fifo["adjusted_net"]) * 100) if fifo["adjusted_net"] else 0
+    safety_fallback = selected_label == "FIFO" and not admission_mode
+    profit_delta = ai["adjusted_net"] - fifo["adjusted_net"]
+    profit_improvement = (profit_delta / fifo["adjusted_net"] * 100) if fifo["adjusted_net"] > 0 else 0
     eta_improvement = ((fifo["avg_eta"] - ai["avg_eta"]) / fifo["avg_eta"] * 100) if fifo["avg_eta"] else 0
     on_time_advantage = ai["on_time_rate"] - fifo["on_time_rate"]
     return {
         "fifo": fifo,
         "ai": ai,
         "profit_improvement": profit_improvement,
+        "profit_delta": profit_delta,
         "eta_improvement": eta_improvement,
         "on_time_advantage": on_time_advantage,
         "sequence": ai_sequence,
         "safety_fallback": safety_fallback,
         "selected_label": selected_label,
+        "fifo_orders": fifo_orders,
+        "ai_orders": ai_orders,
+        "admission_mode": admission_mode,
     }
 
 
@@ -392,6 +495,8 @@ def kpi_status(value: float, target: float, higher_is_better: bool = True) -> st
 
 if "orders" not in st.session_state:
     st.session_state.orders = []
+if "requested_orders" not in st.session_state:
+    st.session_state.requested_orders = []
 if "day_type" not in st.session_state:
     st.session_state.day_type = "Regular day"
 if "evaluation" not in st.session_state:
@@ -443,7 +548,7 @@ with tab_dashboard:
         tuesday = st.checkbox("Tuesday: 2 chefs", key="tuesday_select")
     with c3:
         if st.button("🎬 Load Scenario"):
-            st.session_state.orders, rejected = build_orders(day_type, tuesday)
+            st.session_state.orders, rejected, st.session_state.requested_orders = build_orders(day_type, tuesday)
             st.session_state.day_type = day_type
             st.session_state.tuesday = tuesday
             st.session_state.evaluation = None
@@ -452,6 +557,7 @@ with tab_dashboard:
     with c4:
         if st.button("🗑 Reset"):
             st.session_state.orders = []
+            st.session_state.requested_orders = []
             st.session_state.evaluation = None
             st.rerun()
 
@@ -467,7 +573,11 @@ with tab_dashboard:
         display["EstimatedSLA_Buffer"] = SLA_MINUTES - display["EstimatedETA"]
         st.dataframe(display, use_container_width=True, height=360)
         if st.button("🤖 Analyze & Compare", type="primary"):
-            st.session_state.evaluation = run_evaluation(st.session_state.orders, st.session_state.tuesday)
+            st.session_state.evaluation = run_evaluation(
+                st.session_state.orders,
+                st.session_state.tuesday,
+                st.session_state.requested_orders,
+            )
 
         result = st.session_state.evaluation
         if result:
@@ -507,6 +617,12 @@ with tab_dashboard:
                 )
             else:
                 st.info("PizzaFlow AI ו־FIFO השיגו אותה עמידה ב־SLA בתרחיש זה.")
+
+            if fifo["adjusted_net"] <= 0 and result["profit_delta"] > 0:
+                st.success(
+                    f"💰 PizzaFlow AI avoided a FIFO loss of {money(result['profit_delta'])}. "
+                    "A percentage comparison is not meaningful when the FIFO baseline is negative."
+                )
 
             st.subheader("FIFO vs PizzaFlow AI")
             if result["safety_fallback"]:
