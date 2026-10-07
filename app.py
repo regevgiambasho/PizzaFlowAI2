@@ -192,11 +192,33 @@ def local_ai_ids(orders: list[dict[str, Any]]) -> list[int]:
     ]
 
 
+def sla_aware_ids(orders: list[dict[str, Any]]) -> list[int]:
+    """Prioritize work that is most likely to create a downstream SLA delay.
+
+    Within each five-minute arrival window, longer production jobs are started
+    earlier so they do not accumulate at the back of the queue. Profit/ETA is
+    used as a tie-breaker, preserving the business objective.
+    """
+    return [
+        int(row["OrderID"])
+        for row in sorted(
+            orders,
+            key=lambda x: (
+                x["ArrivalMinute"] // 5,
+                -x["EstimatedETA"],
+                -priority_score(x),
+                x["OrderID"],
+            ),
+        )
+    ]
+
+
 def optimizer_candidates(orders: list[dict[str, Any]]) -> list[tuple[str, list[int]]]:
     """Generate transparent schedules for the local optimizer to evaluate."""
     return [
         ("FIFO", fifo_ids(orders)),
         ("Profit / ETA (5-minute window)", local_ai_ids(orders)),
+        ("SLA-aware production sequencing", sla_aware_ids(orders)),
         (
             "Profit / ETA (15-minute window)",
             [
@@ -442,6 +464,7 @@ with tab_dashboard:
         st.write(f"Scenario: **{st.session_state.day_type}** | Requested pizzas: **{requested}** | Accepted pizzas: **{accepted_pizzas}** | Rejected pizzas: **{rejected}** | Orders: **{len(st.session_state.orders)}**")
         display = pd.DataFrame(st.session_state.orders).copy()
         display["Priority"] = display.apply(priority_score, axis=1)
+        display["EstimatedSLA_Buffer"] = SLA_MINUTES - display["EstimatedETA"]
         st.dataframe(display, use_container_width=True, height=360)
         if st.button("🤖 Analyze & Compare", type="primary"):
             st.session_state.evaluation = run_evaluation(st.session_state.orders, st.session_state.tuesday)
@@ -490,6 +513,11 @@ with tab_dashboard:
                 st.info("The optimizer evaluated several schedules and selected FIFO because it was the best available schedule for this scenario.")
             else:
                 st.success(f"The optimizer selected: {result['selected_label']}")
+                if result["selected_label"] == "SLA-aware production sequencing":
+                    st.info(
+                        "The AI sequenced longer jobs earlier within each arrival window, "
+                        "reducing queue buildup while keeping Profit/ETA as a tie-breaker."
+                    )
             comparison = pd.DataFrame({
                 "Strategy": ["FIFO", "PizzaFlow AI"],
                 "Adjusted Net Profit": [fifo["adjusted_net"], ai["adjusted_net"]],
