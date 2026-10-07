@@ -7,6 +7,7 @@ be Generative AI when no API key is configured.
 from __future__ import annotations
 
 import math
+import json
 import os
 import random
 from typing import Any
@@ -150,6 +151,13 @@ def generate_manager_advice(
         "temporary_oven_chambers": ai["extra_oven_chambers"],
         "extra_packers": ai["extra_packers"],
     }
+    # Streamlit deployments may expose an ASCII default locale. Encoding the
+    # request payload as JSON with standard Unicode escapes keeps Hebrew input
+    # safe while preserving its exact meaning for the model.
+    request_payload = json.dumps(
+        {"manager_question": question, "simulation_facts": context},
+        ensure_ascii=True,
+    )
     response = client.responses.create(
         model=model,
         instructions=(
@@ -161,8 +169,9 @@ def generate_manager_advice(
             "that you changed the schedule or executed an action."
         ),
         input=(
-            f"Manager question: {question}\n"
-            f"Simulation facts: {context}\n"
+            "The JSON below contains standard Unicode escape sequences. "
+            "Interpret the escaped Hebrew text before answering.\n"
+            f"JSON payload: {request_payload}\n"
             "Answer in Hebrew with three short sections: recommendation, "
             "risk/limitation, human approval."
         ),
