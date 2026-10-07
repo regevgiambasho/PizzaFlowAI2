@@ -7,6 +7,7 @@ be Generative AI when no API key is configured.
 from __future__ import annotations
 
 import math
+import os
 import random
 from typing import Any
 
@@ -111,6 +112,62 @@ DRINK_COST = {"None": 0, "Can": 2, "Large Bottle": 6}
 
 def money(value: float) -> str:
     return f"₪{value:,.0f}"
+
+
+def openai_api_key() -> str | None:
+    """Read the API key from Streamlit Secrets or the environment only."""
+    try:
+        secret_key = st.secrets.get("OPENAI_API_KEY")
+    except Exception:
+        secret_key = None
+    return secret_key or os.getenv("OPENAI_API_KEY")
+
+
+def generate_manager_advice(
+    question: str,
+    day_type: str,
+    result: dict[str, Any],
+) -> str:
+    """Generate a grounded managerial explanation from the simulation output."""
+    from openai import OpenAI
+
+    fifo = result["fifo"]
+    ai = result["ai"]
+    model = os.getenv("PIZZAFLOW_MODEL", "gpt-4o-mini")
+    client = OpenAI(api_key=openai_api_key())
+    context = {
+        "scenario": day_type,
+        "profit_improvement_percent": round(result["profit_improvement"], 2),
+        "fifo_adjusted_net_profit": round(fifo["adjusted_net"], 2),
+        "pizzaflow_adjusted_net_profit": round(ai["adjusted_net"], 2),
+        "fifo_on_time_percent": round(fifo["on_time_rate"], 2),
+        "pizzaflow_on_time_percent": round(ai["on_time_rate"], 2),
+        "delivery_time_improvement_percent": round(result["eta_improvement"], 2),
+        "compensation_percent": round(ai["compensation_rate"], 2),
+        "full_refund_percent": round(ai["full_refund_rate"], 2),
+        "peak_surcharge": round(ai["event_surcharge_total"], 2),
+        "extra_chefs": ai["extra_chefs"],
+        "temporary_oven_chambers": ai["extra_oven_chambers"],
+        "extra_packers": ai["extra_packers"],
+    }
+    response = client.responses.create(
+        model=model,
+        instructions=(
+            "You are the managerial explanation layer of PizzaFlow AI. "
+            "Use only the supplied simulation facts. Do not invent orders, costs, "
+            "KPIs, or operational results. Explain the trade-off between service "
+            "and profitability in clear Hebrew. Give a short recommendation, "
+            "one risk or limitation, and one human approval step. Never claim "
+            "that you changed the schedule or executed an action."
+        ),
+        input=(
+            f"Manager question: {question}\n"
+            f"Simulation facts: {context}\n"
+            "Answer in Hebrew with three short sections: recommendation, "
+            "risk/limitation, human approval."
+        ),
+    )
+    return response.output_text
 
 
 def compensation(delivery_minutes: float, revenue: float) -> tuple[float, str]:
@@ -559,7 +616,10 @@ if "tuesday" not in st.session_state:
 
 st.title("🍕 PizzaFlow AI")
 st.caption("Explainable decision-support for a dark kitchen with autonomous drone delivery")
-st.info("Local transparent engine active. It does not claim to be Generative AI without an API connection.")
+if openai_api_key():
+    st.info("Local optimization engine + Generative AI manager layer active.")
+else:
+    st.info("Local transparent optimization engine active. Add OPENAI_API_KEY in Streamlit Secrets to enable the Generative AI manager layer.")
 
 tab_orders, tab_dashboard, tab_method = st.tabs(["🍕 Orders", "📊 Dashboard", "🛡 Method & Responsible AI"])
 
@@ -726,6 +786,36 @@ with tab_dashboard:
             st.subheader("Business Outcome")
             st.dataframe(ai["details"].head(30), use_container_width=True)
 
+            st.subheader("🧠 Generative AI Manager Copilot")
+            st.caption(
+                "The Generative AI layer explains the measured simulation results in natural language. "
+                "It does not alter orders, KPIs, prices, or schedules."
+            )
+            manager_question = st.text_area(
+                "Manager question",
+                value="האם כדאי להפעיל את מדיניות השיא בתרחיש הזה, ומה הסיכון המרכזי?",
+                key="manager_question",
+            )
+            if st.button("🧠 Generate managerial recommendation"):
+                if not openai_api_key():
+                    st.warning(
+                        "Generative AI is ready but not connected. Add OPENAI_API_KEY "
+                        "under Streamlit Settings → Secrets and reboot the app."
+                    )
+                elif not manager_question.strip():
+                    st.warning("Please enter a managerial question.")
+                else:
+                    try:
+                        with st.spinner("Generating grounded recommendation..."):
+                            advice = generate_manager_advice(
+                                manager_question,
+                                st.session_state.day_type,
+                                result,
+                            )
+                        st.markdown(advice)
+                    except Exception as exc:
+                        st.error(f"Generative AI request failed: {exc}")
+
 with tab_method:
     st.header("Method & Responsible AI")
     st.markdown("""
@@ -736,6 +826,8 @@ with tab_method:
 **Resources:** 3 chefs normally (2 on Tuesday), 1 packer, 1 drone loader, 1 battery technician, Oven A with 3 chambers, Oven B with 2, and Oven C with 1 chamber that needs 5 minutes warm-up and costs 10 ₪ per pizza. Under the approved option 2 peak policy, PizzaFlow can activate temporary peak capacity and a transparent peak surcharge; those additions are shown in the dashboard and included in net profit.
 
 **Responsible AI:** The current deployment is a transparent local fallback. It uses only the supplied order fields, does not invent order IDs, and exposes its assumptions. A human remains responsible for operational decisions.
+
+**Generative AI layer:** When `OPENAI_API_KEY` is configured, the manager copilot uses the OpenAI Responses API to explain the measured simulation results in Hebrew. It receives only aggregated scenario metrics, cannot change the simulation, and requires human approval before any operational action. API keys are stored in Streamlit Secrets and are not included in the source code.
 """)
     st.subheader("Operating assumptions")
     st.json({
