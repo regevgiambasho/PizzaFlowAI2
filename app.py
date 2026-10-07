@@ -38,11 +38,17 @@ PEAK_SHARE = {
 }
 PEAK_START = 18 * 60
 PEAK_END = 22 * 60
+PEAK_RANGE_BY_DAY = {
+    "Regular day": (18 * 60, 22 * 60),
+    "Weak Sunday": (18 * 60, 22 * 60),
+    "Busy Thursday": (18 * 60, 22 * 60),
+    "City event Thursday": (17 * 60, 23 * 60),
+}
 PEAK_WINDOW_MINUTES = {
     "Regular day": 240,
     "Weak Sunday": 240,
-    "Busy Thursday": 60,
-    "City event Thursday": 60,
+    "Busy Thursday": 240,
+    "City event Thursday": 360,
 }
 
 CHEFS_NORMAL = 3
@@ -150,11 +156,10 @@ def build_orders(day_type: str, tuesday: bool, seed: int = 42) -> tuple[list[dic
         remaining = accepted_target - accepted_pizzas
         pizza_count = min(rng.randint(1, 5), remaining)
         if rng.random() < PEAK_SHARE[day_type]:
-            peak_window = PEAK_WINDOW_MINUTES[day_type]
-            peak_center = 19 * 60
+            peak_start, peak_end = PEAK_RANGE_BY_DAY[day_type]
             arrival = rng.randint(
-                max(PEAK_START, peak_center - peak_window // 2),
-                min(PEAK_END - 1, peak_center + peak_window // 2),
+                peak_start,
+                peak_end - 1,
             )
         else:
             arrival = KITCHEN_START + rng.randint(0, KITCHEN_END - KITCHEN_START - 30)
@@ -437,15 +442,20 @@ with tab_dashboard:
                 )
             st.subheader("KPI Dashboard")
             k1, k2, k3, k4, k5 = st.columns(5)
-            k1.metric("AI on-time", f"{ai['on_time_rate']:.1f}%", f"{kpi_status(ai['on_time_rate'], 98)} target 98%")
+            k1.metric("AI on-time", f"{ai['on_time_rate']:.1f}%", delta_color="off")
+            k1.caption(f"{kpi_status(ai['on_time_rate'], 98)} יעד: 98%")
             k2.metric(
                 "Profit improvement",
                 "Stress test" if stress_test else f"{result['profit_improvement']:.1f}%",
-                None if stress_test else f"{kpi_status(result['profit_improvement'], 15)} target 15%",
+                delta_color="off",
             )
-            k3.metric("Delivery improvement", f"{result['eta_improvement']:.1f}%", f"{kpi_status(result['eta_improvement'], 10)} target 10%")
-            k4.metric("Compensation", f"{ai['compensation_rate']:.2f}%", f"{kpi_status(ai['compensation_rate'], 1, False)} max 1%")
-            k5.metric("Full refunds", f"{ai['full_refund_rate']:.2f}%", f"{kpi_status(ai['full_refund_rate'], 0.1, False)} max 0.1%")
+            k2.caption("⚪ לא נמדד כיעד רגיל" if stress_test else f"{kpi_status(result['profit_improvement'], 15)} יעד: 15%")
+            k3.metric("Delivery improvement", f"{result['eta_improvement']:.1f}%", delta_color="off")
+            k3.caption(f"{kpi_status(result['eta_improvement'], 10)} יעד: 10%")
+            k4.metric("Compensation", f"{ai['compensation_rate']:.2f}%", delta_color="off")
+            k4.caption(f"{kpi_status(ai['compensation_rate'], 1, False)} מקסימום: 1%")
+            k5.metric("Full refunds", f"{ai['full_refund_rate']:.2f}%", delta_color="off")
+            k5.caption(f"{kpi_status(ai['full_refund_rate'], 0.1, False)} מקסימום: 0.1%")
 
             st.subheader("FIFO vs PizzaFlow AI")
             if result["safety_fallback"]:
