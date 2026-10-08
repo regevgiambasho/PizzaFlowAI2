@@ -146,6 +146,7 @@ def current_result_answer(day_type: str, result: dict[str, Any]) -> str:
     fifo = result["fifo"]
     ai = result["ai"]
     selected = result["selected_label"]
+    recommendation = manager_recommendation(result)
     improvement = result["profit_improvement"]
     improvement_text = (
         f"שיפור של {improvement:.1f}% ברווח הנקי המתואם"
@@ -162,9 +163,38 @@ def current_result_answer(day_type: str, result: dict[str, Any]) -> str:
         f"• פיצויים ב־PizzaFlow: {ai['compensation_rate']:.2f}% מההזמנות; "
         f"החזרים מלאים: {ai['full_refund_rate']:.2f}%.\n"
         f"• מדיניות התזמון שנבחרה: **{selected}**.\n\n"
+        f"• החלטה תפעולית לאישור מנהל: **{recommendation['action']}**.\n\n"
         "המלצה: להשתמש בתוצאה כבסיס להחלטה, אבל לבדוק אנושית את עלות התוספת "
         "והאם הביקוש בפועל דומה להנחות הסימולציה."
     )
+
+
+def manager_recommendation(result: dict[str, Any]) -> dict[str, str]:
+    """Describe the concrete operational action that requires manager approval."""
+    ai = result["ai"]
+    actions: list[str] = []
+    if ai["extra_chefs"]:
+        count = int(ai["extra_chefs"])
+        actions.append(f"להוסיף {count} טבח זמני")
+    if ai["extra_oven_chambers"]:
+        count = int(ai["extra_oven_chambers"])
+        actions.append(f"להפעיל {count} תאי תנור זמניים")
+    if ai["extra_packers"]:
+        count = int(ai["extra_packers"])
+        actions.append(f"להוסיף {count} עובד אריזה")
+    if ai["surcharge_rate"]:
+        actions.append(f"להפעיל תוספת מחיר של {ai['surcharge_rate']:.0%}")
+
+    if actions:
+        action = " + ".join(actions)
+    else:
+        action = "לאשר את רצף הייצור ללא תגבור משאבים או תוספת מחיר"
+    details = (
+        f"רצף הייצור המומלץ: {result['selected_label']}. "
+        f"הרווח הנקי המתואם הצפוי: {money(ai['adjusted_net'])}; "
+        f"עמידה צפויה ב־SLA: {ai['on_time_rate']:.1f}%."
+    )
+    return {"action": action, "details": details}
 
 
 def infer_day_type(question: str, fallback: str) -> str:
@@ -345,7 +375,7 @@ def local_manager_answer(
     if best_intent == "kpi":
         return (
             "ה־KPI שהוגדרו הם: 98% מההזמנות עד 40 דקות; שיפור רווח מול FIFO; "
-            "שיפור של 10% בזמן האספקה; פחות מ־1% הזמנות עם פיצוי; ופחות מ־0.1% "
+            "שיפור של 10% בזמן האספקה בתרחישי עומס בלבד; פחות מ־1% הזמנות עם פיצוי; ופחות מ־0.1% "
             "החזרים מלאים. בגרסה הנוכחית יעדי השיפור לתרחישים מוצגים בנפרד: קטן ביום רגיל, "
             "כ־10% בחמישי, ו־16%–20% באירוע עירוני."
         )
@@ -938,7 +968,14 @@ with tab_dashboard:
                 f"יעד תרחיש: {scenario_profit_target:.0f}% | KPI מקורי: 15%"
             )
             k3.metric("Delivery improvement", f"{result['eta_improvement']:.1f}%", delta_color="off")
-            k3.caption(f"{kpi_status(result['eta_improvement'], 10)} יעד: 10%")
+            delivery_target_applies = st.session_state.day_type in {
+                "Busy Thursday",
+                "City event Thursday",
+            }
+            if delivery_target_applies:
+                k3.caption(f"{kpi_status(result['eta_improvement'], 10)} יעד עומס: 10%")
+            else:
+                k3.caption("ℹ️ יעד של 10% נבחן בתרחישי עומס בלבד")
             k4.metric("Compensation", f"{ai['compensation_rate']:.2f}%", delta_color="off")
             k4.caption(f"{kpi_status(ai['compensation_rate'], 1, False)} מקסימום: 1%")
             k5.metric("Full refunds", f"{ai['full_refund_rate']:.2f}%", delta_color="off")
@@ -963,15 +1000,21 @@ with tab_dashboard:
                 )
 
             st.subheader("FIFO vs PizzaFlow AI")
-            if result["safety_fallback"]:
-                st.info("The optimizer evaluated several schedules and selected FIFO because it was the best available schedule for this scenario.")
-            else:
-                st.success(f"The optimizer selected: {result['selected_label']}")
-                if result["selected_label"] == "SLA-aware production sequencing":
-                    st.info(
-                        "The AI sequenced longer jobs earlier within each arrival window, "
-                        "reducing queue buildup while keeping Profit/ETA as a tie-breaker."
-                    )
+            st.success(
+                "The optimizer compared FIFO and four alternative schedules and selected: "
+                f"{result['selected_label']}"
+            )
+            if result["selected_label"] == "FIFO":
+                st.info(
+                    "FIFO was the best evaluated production sequence in this run. "
+                    "The PizzaFlow result can still differ from the bare FIFO baseline "
+                    "because the approved peak policy may add capacity or a transparent surcharge."
+                )
+            elif result["selected_label"] == "SLA-aware production sequencing":
+                st.info(
+                    "The AI sequenced longer jobs earlier within each arrival window, "
+                    "reducing queue buildup while keeping Profit/ETA as a tie-breaker."
+                )
             comparison = pd.DataFrame({
                 "Strategy": ["FIFO", "PizzaFlow AI"],
                 "Adjusted Net Profit": [fifo["adjusted_net"], ai["adjusted_net"]],
@@ -1004,11 +1047,14 @@ with tab_dashboard:
 
             st.subheader("👤 Human Approval and Decision Tracking")
             st.caption(
-                "PizzaFlow is a decision-support system. The manager reviews the recommendation and records "
-                "a decision before any operational change is made."
+                "PizzaFlow is a decision-support system. The manager first reviews the concrete operational "
+                "action below, then records whether to approve it, reject it, or request more information."
             )
+            recommendation = manager_recommendation(result)
+            st.markdown("**החלטה תפעולית שעל המנהל לאשר:**")
+            st.info(f"🤖 {recommendation['action']}\n\n{recommendation['details']}")
             manager_decision = st.selectbox(
-                "Manager decision",
+                "החלטת המנהל לגבי ההמלצה לעיל",
                 MANAGER_DECISIONS,
                 key="manager_decision",
             )
@@ -1020,6 +1066,7 @@ with tab_dashboard:
                         {
                             "Time": datetime.now().strftime("%Y-%m-%d %H:%M"),
                             "Scenario": st.session_state.day_type,
+                            "Operational recommendation": recommendation["action"],
                             "Decision": manager_decision,
                             "AI policy": result["selected_label"],
                             "Profit improvement": f"{result['profit_improvement']:.1f}%",
@@ -1066,7 +1113,9 @@ with tab_method:
 
 **Responsible AI:** The current deployment is a transparent local system. It uses only the supplied order fields, does not invent order IDs, and exposes its assumptions. A human remains responsible for operational decisions.
 
-**Users and end-to-end process:** Operations staff create or load orders. The local AI engine calculates priority, tests candidate production sequences, evaluates the SLA and adjusted net profit, and presents the recommendation to the manager. The manager can approve the recommendation, reject it, or request more information. The selected decision is recorded in the dashboard so the scenario and decision can be reviewed later. Kitchen, packing and drone staff are the operational stakeholders who execute an approved plan.
+**Users and end-to-end process:** Operations staff create or load orders. The local AI engine calculates priority, tests candidate production sequences, evaluates the SLA and adjusted net profit, and presents a concrete operational recommendation such as activating temporary oven chambers, adding a chef or packer, applying a peak surcharge, or keeping the normal plan. The manager reviews that action and can approve it, reject it, or request more information. The selected decision is recorded in the dashboard so the scenario and decision can be reviewed later. Kitchen, packing and drone staff are the operational stakeholders who execute an approved plan.
+
+**KPI scope:** The 10% delivery-time improvement target is evaluated on the high-load scenarios—Busy Thursday and City event Thursday. Regular and weak days are monitored as baseline scenarios and are not marked as KPI failures when the 10% load target is not applicable.
 
 **Tools and integration:** ChatGPT was used to help characterize the challenge and write the prototype code. Python, Streamlit and Plotly implement the working system, and GitHub plus Streamlit Community Cloud provide version control and deployment. The local assistant is grounded in the application specification and simulation output; no external connector or paid model is required.
 
