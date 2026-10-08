@@ -20,8 +20,9 @@ and the current simulation output using local intent matching and grounded respo
 2. Click **Run Demo Scenario**.
 3. Click **Analyze & Compare**.
 4. Show the AI recommendation and the FIFO comparison.
-5. Ask the local manager assistant a question, for example: “איך האלגוריתם משפר את ה־SLA?”
-6. Open **Method & Responsible AI** to explain the assumptions and controls.
+5. Record a manager decision: approve, reject, or request more information.
+6. Ask the local manager assistant a question, for example: “איך האלגוריתם משפר את ה־SLA?”
+7. Open **Method & Responsible AI** to explain the users, process, assumptions and controls.
 
 The comparison uses the same orders and the same simulator for both strategies. The local AI engine
 evaluates transparent candidate schedules; the simulator calculates profit, delivery time and on-time rate.

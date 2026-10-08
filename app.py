@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 import random
 import re
+from datetime import datetime
 from typing import Any
 
 import pandas as pd
@@ -799,6 +800,14 @@ def kpi_status(value: float, target: float, higher_is_better: bool = True) -> st
     return "✅" if (value >= target if higher_is_better else value <= target) else "⚠️"
 
 
+MANAGER_DECISIONS = [
+    "Pending",
+    "Approve recommendation",
+    "Reject recommendation",
+    "Request more information",
+]
+
+
 if "orders" not in st.session_state:
     st.session_state.orders = []
 if "requested_orders" not in st.session_state:
@@ -811,6 +820,10 @@ if "tuesday" not in st.session_state:
     st.session_state.tuesday = False
 if "assistant_answer" not in st.session_state:
     st.session_state.assistant_answer = ""
+if "manager_decision" not in st.session_state:
+    st.session_state.manager_decision = "Pending"
+if "decision_history" not in st.session_state:
+    st.session_state.decision_history = []
 
 
 st.title("🍕 PizzaFlow AI")
@@ -861,6 +874,7 @@ with tab_dashboard:
             st.session_state.tuesday = tuesday
             st.session_state.evaluation = None
             st.session_state.assistant_answer = ""
+            st.session_state.manager_decision = "Pending"
             accepted_pizzas = sum(int(x["PizzaCount"]) for x in st.session_state.orders)
             st.success(f"Loaded {accepted_pizzas} accepted pizzas in {len(st.session_state.orders)} orders. Rejected pizzas after capacity: {rejected}.")
     with c4:
@@ -869,6 +883,8 @@ with tab_dashboard:
             st.session_state.requested_orders = []
             st.session_state.evaluation = None
             st.session_state.assistant_answer = ""
+            st.session_state.manager_decision = "Pending"
+            st.session_state.decision_history = []
             st.rerun()
 
     if not st.session_state.orders:
@@ -890,6 +906,7 @@ with tab_dashboard:
                 st.session_state.day_type,
             )
             st.session_state.assistant_answer = ""
+            st.session_state.manager_decision = "Pending"
 
         result = st.session_state.evaluation
         if result:
@@ -985,6 +1002,39 @@ with tab_dashboard:
             st.subheader("Business Outcome")
             st.dataframe(ai["details"].head(30), use_container_width=True)
 
+            st.subheader("👤 Human Approval and Decision Tracking")
+            st.caption(
+                "PizzaFlow is a decision-support system. The manager reviews the recommendation and records "
+                "a decision before any operational change is made."
+            )
+            manager_decision = st.selectbox(
+                "Manager decision",
+                MANAGER_DECISIONS,
+                key="manager_decision",
+            )
+            if st.button("💾 Save manager decision"):
+                if manager_decision == "Pending":
+                    st.warning("Choose Approve, Reject, or Request more information before saving.")
+                else:
+                    st.session_state.decision_history.append(
+                        {
+                            "Time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                            "Scenario": st.session_state.day_type,
+                            "Decision": manager_decision,
+                            "AI policy": result["selected_label"],
+                            "Profit improvement": f"{result['profit_improvement']:.1f}%",
+                            "AI on-time": f"{ai['on_time_rate']:.1f}%",
+                        }
+                    )
+                    st.success(f"Manager decision recorded: {manager_decision}")
+            if st.session_state.decision_history:
+                st.caption("Decision history")
+                st.dataframe(
+                    pd.DataFrame(st.session_state.decision_history),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
             st.subheader("🧠 Local AI Manager Assistant")
             st.caption(
                 "Ask questions in Hebrew or English. The assistant answers locally from the PizzaFlow "
@@ -1015,6 +1065,10 @@ with tab_method:
 **Resources:** 3 chefs normally (2 on Tuesday), 1 packer, 1 drone loader, 1 battery technician, Oven A with 3 chambers, Oven B with 2, and Oven C with 1 chamber that needs 5 minutes warm-up and costs 10 ₪ per pizza. Under the approved option 2 peak policy, PizzaFlow can activate temporary peak capacity and a transparent peak surcharge; those additions are shown in the dashboard and included in net profit.
 
 **Responsible AI:** The current deployment is a transparent local system. It uses only the supplied order fields, does not invent order IDs, and exposes its assumptions. A human remains responsible for operational decisions.
+
+**Users and end-to-end process:** Operations staff create or load orders. The local AI engine calculates priority, tests candidate production sequences, evaluates the SLA and adjusted net profit, and presents the recommendation to the manager. The manager can approve the recommendation, reject it, or request more information. The selected decision is recorded in the dashboard so the scenario and decision can be reviewed later. Kitchen, packing and drone staff are the operational stakeholders who execute an approved plan.
+
+**Tools and integration:** ChatGPT was used to help characterize the challenge and write the prototype code. Python, Streamlit and Plotly implement the working system, and GitHub plus Streamlit Community Cloud provide version control and deployment. The local assistant is grounded in the application specification and simulation output; no external connector or paid model is required.
 
 **Local manager assistant:** The assistant uses local intent matching and grounded response templates over the project specification and the current simulation output. It requires no API key, sends no data outside the app, cannot change the simulation, and is not presented as a general-purpose generative language model. This makes the public prototype reproducible at zero service cost.
 """)
